@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Sistema Seguro de Avaliações — Prof. Felipe Vigneron Azevedo</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e293b}
+input,textarea,button,select{font-family:inherit}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
+.btn{padding:10px 18px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#1e293b;font-weight:600;cursor:pointer;font-size:14px;transition:all .15s}
+.btn:hover{background:#f1f5f9}.btn.primary{background:#166534;color:#fff;border:none}
+.btn.primary:hover{background:#15803d}.btn.primary:disabled{background:#94a3b8;cursor:not-allowed}
+.btn.danger{background:#dc2626;color:#fff;border:none}.btn.sm{padding:6px 12px;font-size:13px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px 24px}
+.inp{width:100%;padding:9px 12px;border:1.5px solid #d1d5db;border-radius:8px;background:#fff;color:#1e293b;font-size:14px;outline:none;transition:border-color .15s}
+.inp:focus{border-color:#166534}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:12px;font-weight:600}
+.hdr{background:#dcfce7;border-bottom:2px solid #86efac;padding:14px 22px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.hdr-title{font-weight:800;font-size:16px;color:#14532d}
+.hdr-sub{font-size:12px;color:#166534;margin-top:1px}
+.tab{padding:6px 14px;border-radius:20px;border:1px solid #86efac;cursor:pointer;font-weight:600;font-size:13px;background:transparent;color:#166534;transition:all .15s}
+.tab.active{background:#166534;color:#fff;border-color:#166534}
+.tab:hover:not(.active){background:#bbf7d0}
+label{display:block;font-size:12px;color:#64748b;margin-bottom:4px;font-weight:600}
+.spin{display:inline-block;width:16px;height:16px;border:2px solid #86efac;border-top-color:#166534;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:999;padding:16px}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// ══════════════════════════════════════════
+// CONSTANTES
+// ══════════════════════════════════════════
+const APP_NAME    = "Sistema Seguro de Avaliações";
+const PROF_NAME   = "Prof. Felipe Vigneron Azevedo";
+const PASS        = "iff2024";
+const DISCIPLINAS = ["Teoria Literária I","Literatura Brasileira I","Literatura Brasileira II","Metodologia de Pesquisa"];
+const TIPOS       = ["P1","P2","P3","Quiz"];
+const SEMESTRE    = "2026.1";
+// Tolerância de blur antes de contar violação (ms) — evita falso positivo por clique acidental
+const BLUR_TOLERANCIA_MS = 2500;
+
+// ══════════════════════════════════════════
+// CONFIG
+// ══════════════════════════════════════════
+const CFG = {
+  get gasUrl(){ try{return JSON.parse(localStorage.getItem("iff_cfg")||"{}").gasUrl||""}catch{return""} },
+  set gasUrl(v){ localStorage.setItem("iff_cfg",JSON.stringify({gasUrl:v})) }
+};
+
+// ══════════════════════════════════════════
+// API — com retry automático e erros claros
+// ══════════════════════════════════════════
+async function api(dados, tentativas=3) {
+  const url = CFG.gasUrl;
+  if (!url) throw new Error("URL do Apps Script não configurada. Vá em ⚙️ Config e cole a URL.");
+  const isPublico = ["buscarProva","listarAlunos"].includes(dados.acao) && !dados.senha;
+  let ultimoErro;
+  for (let t = 0; t < tentativas; t++) {
+    try {
+      let resp;
+      if (isPublico) {
+        const params = new URLSearchParams(dados);
+        resp = await fetch(url+"?"+params, {method:"GET", signal:AbortSignal.timeout(12000)});
+      } else {
+        resp = await fetch(url, {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify(dados),
+          signal:AbortSignal.timeout(15000)
+        });
+      }
+      if (!resp.ok) throw new Error(`Servidor retornou HTTP ${resp.status}`);
+      return await resp.json();
+    } catch(e) {
+      ultimoErro = e;
+      if (t < tentativas-1) await new Promise(r=>setTimeout(r,1200*(t+1)));
+    }
+  }
+  // Traduz erros técnicos para mensagens amigáveis
+  const msg = ultimoErro?.message||"";
+  if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("Load failed"))
+    throw new Error("Sem conexão com o servidor. Verifique sua internet e tente novamente.");
+  if (msg.includes("timeout") || msg.includes("AbortError"))
+    throw new Error("O servidor demorou demais para responder. Tente novamente.");
+  if (msg.includes("HTTP 4"))
+    throw new Error("Erro na URL do Apps Script. Verifique a configuração.");
+  throw new Error(ultimoErro?.message || "Erro desconhecido.");
+}
+
+// ══════════════════════════════════════════
+// BACKUP LOCAL — salva progresso do aluno
+// ══════════════════════════════════════════
+const BKP = {
+  chave(provaId, matricula){ return `iff_bkp_${provaId}_${matricula}`; },
+  salvar(provaId, matricula, dados){ try{sessionStorage.setItem(BKP.chave(provaId,matricula),JSON.stringify({...dados,ts:Date.now()}))}catch{} },
+  ler(provaId, matricula){ try{const d=sessionStorage.getItem(BKP.chave(provaId,matricula));return d?JSON.parse(d):null}catch{return null} },
+  limpar(provaId, matricula){ try{sessionStorage.removeItem(BKP.chave(provaId,matricula))}catch{} },
+  // Fila de resultados pendentes (falha de rede)
+  salvarPendente(res){ try{const k="iff_pendentes";const a=JSON.parse(localStorage.getItem(k)||"[]");a.push({...res,_ts:Date.now()});localStorage.setItem(k,JSON.stringify(a))}catch{} },
+  pendentes(){ try{return JSON.parse(localStorage.getItem("iff_pendentes")||"[]")}catch{return[]} },
+  limparPendentes(){ localStorage.removeItem("iff_pendentes"); }
+};
+
+// Tenta reenviar resultados pendentes ao reconectar
+async function reenviarPendentes() {
+  const lista = BKP.pendentes();
+  if (!lista.length || !CFG.gasUrl) return;
+  let ok = 0;
+  for (const res of lista) {
+    try {
+      const r = await api({acao:"salvarResultado", resultado:res, token:res._token}, 1);
+      if (r.ok) ok++;
+    } catch{}
+  }
+  if (ok > 0) {
+    BKP.limparPendentes();
+    console.log(`[SSA] ${ok} resultado(s) pendente(s) reenviado(s).`);
+  }
+}
+window.addEventListener("online", reenviarPendentes);
+
+// ══════════════════════════════════════════
+// PARSERS
+// ══════════════════════════════════════════
+function parseQ(txt) {
+  const qs = [];
+  const blocos = txt.split(/\n(?=\d+[\.\)])/);
+  for (const b of blocos) {
+    const ls = b.trim().split("\n").map(l=>l.trim()).filter(Boolean);
+    if (!ls.length) continue;
+    const enunc = ls[0].replace(/^\d+[\.\)]\s*/,"").trim();
+    if (!enunc) continue;
+    const alts = []; let correta = -1;
+    for (let i=1;i<ls.length;i++) {
+      const gab = ls[i].match(/^[Gg]abarito\s*[:=]\s*([A-Ea-e])/);
+      if (gab){correta=gab[1].toUpperCase().charCodeAt(0)-65;continue;}
+      const alt = ls[i].match(/^([A-Ea-e])[\.\)]\s*(.+)/);
+      if (alt) alts.push(alt[2].trim());
+    }
+    if (enunc && alts.length>=2) qs.push({id:qs.length+1,enunciado:enunc,alternativas:alts,correta});
+  }
+  return qs;
+}
+
+function parseAlunos(txt) {
+  const alunos = [];
+  const linhas = txt.split("\n").map(l=>l.trim()).filter(Boolean);
+  for (const l of linhas) {
+    const m = l.match(/^(\d{10,13})\s+(.+?)(?:\s+Cursando|\s+Trancado|\s+Formado)?$/i);
+    if (m){alunos.push({matricula:m[1].trim(),nome:m[2].trim()});continue;}
+    const m2 = l.match(/^(\d{8,13})\s+(.+)$/);
+    if (m2){alunos.push({matricula:m2[1].trim(),nome:m2[2].trim()});continue;}
+    if (l.length>5 && !/^\d+$/.test(l)) alunos.push({matricula:"",nome:l});
+  }
+  return alunos;
+}
+
+// ══════════════════════════════════════════
+// UTILITÁRIOS
+// ══════════════════════════════════════════
+function shuffle(arr,seed){
+  const a=[...arr];let s=seed||42;
+  for(let i=a.length-1;i>0;i--){s=(s*1664525+1013904223)&0xffffffff;const j=Math.abs(s)%(i+1);[a[i],a[j]]=[a[j],a[i]];}
+  return a;
+}
+function fmt(s){return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0")}
+function calcNota(res,qs,pen){
+  let ac=0;
+  for(const q of qs){const r=res[q.id];if(r===undefined)continue;if(q.altMap[r]===q.correta)ac++;}
+  const b=(ac/qs.length)*10;
+  return{ac,tot:qs.length,bruta:b.toFixed(1),final:Math.max(0,b-pen).toFixed(1)};
+}
+function escH(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+
+// ══════════════════════════════════════════
+// ESTADO
+// ══════════════════════════════════════════
+let S = {
+  rota:"home", profLogado:false, abaProf:"provas",
+  provas:[], loadingProvas:false, gasStatus:null, // null|"ok"|"erro"
+  np:{disciplina:"",tipo:"",data:"",semestre:SEMESTRE,descricao:"",tempo:"40",pen:"20",horaIni:"",horaFim:"",texto:"",questoes:[],aba:"editor"},
+  resultadosProva:null, ordenacao:"nome",
+  // aluno
+  alunoNome:"",alunoMatricula:"",alunoProva:null,alunoQs:[],
+  alunoRes:{},alunoViol:0,alunoPen:0,alunoSeg:0,alunoIdx:0,
+  alunoAviso:null,alunoFim:null,alunoToken:null,
+  _enc:false,_timer:null,_viol:null,_vis:null,_blurTs:null,
+  loading:false,loadingMsg:""
+};
+function set(patch){Object.assign(S,patch);render();}
+function setLoad(msg){set({loading:true,loadingMsg:msg||"Aguarde…"})}
+function stopLoad(){set({loading:false,loadingMsg:""})}
+
+// ══════════════════════════════════════════
+// RENDER
+// ══════════════════════════════════════════
+function render(){
+  const app=document.getElementById("app");if(!app)return;
+  app.innerHTML="";
+  if(S.loading){
+    const ov=document.createElement("div");ov.className="overlay";
+    ov.innerHTML=`<div class="card" style="text-align:center;padding:32px 48px"><div class="spin"></div><span style="color:#166534;font-weight:600">${escH(S.loadingMsg)}</span></div>`;
+    app.appendChild(ov);
+  }
+  ({home:renderHome,aviso_prof:renderAvisoProf,prof_login:renderProfLogin,prof:renderProf,
+    aluno_id:renderAlunoId,aluno_prova:renderAlunoProva,aluno_fim:renderAlunoFim
+  }[S.rota]||renderHome)(app);
+}
+
+// ══════════════════════════════════════════
+// HOME
+// ══════════════════════════════════════════
+function renderHome(el){
+  el.innerHTML=`
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#14532d,#15803d);padding:16px">
+    <div class="card" style="max-width:480px;width:100%;text-align:center;padding:44px 36px">
+      <div style="font-size:12px;color:#64748b;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">Sistema de Avaliação</div>
+      <div style="font-size:26px;font-weight:800;color:#14532d;margin-bottom:4px">${APP_NAME}</div>
+      <div style="font-size:14px;color:#166534;margin-bottom:36px">${PROF_NAME}</div>
+      ${!CFG.gasUrl?`<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 14px;font-size:13px;color:#78350f;margin-bottom:18px">⚠️ Configure a URL do Apps Script no painel antes de usar.</div>`:""}
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <button class="btn primary" style="width:100%;padding:15px;font-size:15px" onclick="set({rota:'aluno_id'})">Fazer prova (aluno)</button>
+        <button class="btn" style="width:100%;padding:15px;font-size:15px" onclick="set({rota:'aviso_prof'})">Painel do professor</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ══════════════════════════════════════════
+// AVISO LEGAL
+// ══════════════════════════════════════════
+function renderAvisoProf(el){
+  el.innerHTML=`
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#14532d,#15803d);padding:16px">
+    <div class="card" style="max-width:480px;width:100%">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+        <div style="width:46px;height:46px;border-radius:50%;background:#fee2e2;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">⚖️</div>
+        <div><div style="font-weight:800;font-size:16px;color:#991b1b">Aviso Legal</div>
+        <div style="font-size:12px;color:#64748b">Acesso restrito — ${APP_NAME}</div></div>
+      </div>
+      <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:16px;margin-bottom:20px;font-size:14px;color:#431407;line-height:1.8">
+        Este painel é de <strong>uso exclusivo e intransferível</strong> do titular autorizado.<br><br>
+        Caso você não seja o dono deste painel, o acesso constitui <strong>violação de direitos</strong>. Seus dados de acesso — incluindo endereço IP, dispositivo e horário — poderão ser registrados e utilizados em <strong>futuras denúncias legais</strong>.
+      </div>
+      <div style="font-size:13px;color:#64748b;margin-bottom:18px;text-align:center">Deseja prosseguir para o painel?</div>
+      <div style="display:flex;gap:10px">
+        <button class="btn" style="flex:1;padding:12px" onclick="set({rota:'home'})">← Não, voltar</button>
+        <button class="btn primary" style="flex:1;padding:12px" onclick="set({rota:S.profLogado?'prof':'prof_login'})">Sim, sou o titular →</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ══════════════════════════════════════════
+// LOGIN
+// ══════════════════════════════════════════
+function renderProfLogin(el){
+  el.innerHTML=`
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#14532d,#15803d);padding:16px">
+    <div class="card" style="max-width:360px;width:100%">
+      <div style="margin-bottom:20px">
+        <div style="font-size:17px;font-weight:800;color:#14532d">${APP_NAME}</div>
+        <div style="font-size:13px;color:#64748b">${PROF_NAME}</div>
+      </div>
+      <input class="inp" id="senha" type="password" placeholder="Senha" style="margin-bottom:8px" onkeydown="if(event.key==='Enter')loginProf()"/>
+      <div id="lerr" style="color:#dc2626;font-size:13px;min-height:18px;margin-bottom:8px"></div>
+      <button class="btn primary" style="width:100%;margin-bottom:8px" onclick="loginProf()">Entrar</button>
+      <button class="btn sm" style="width:100%" onclick="set({rota:'home'})">← Voltar</button>
+    </div>
+  </div>`;
+}
+function loginProf(){
+  const s=document.getElementById("senha");
+  if(s&&s.value===PASS){set({rota:"prof",profLogado:true});carregarProvas();}
+  else{const e=document.getElementById("lerr");if(e)e.textContent="Senha incorreta.";}
+}
+
+// ══════════════════════════════════════════
+// PAINEL PROFESSOR
+// ══════════════════════════════════════════
+function renderProf(el){
+  const isRes=S.resultadosProva&&["resultados","analise"].includes(S.abaProf);
+  const dot=S.gasStatus==="ok"?`<span class="status-dot" style="background:#22c55e"></span>`:
+            S.gasStatus==="erro"?`<span class="status-dot" style="background:#dc2626"></span>`:
+            `<span class="status-dot" style="background:#94a3b8"></span>`;
+  const hdr=document.createElement("div");hdr.className="hdr";
+  hdr.innerHTML=`
+    <div><div class="hdr-title">${dot}${APP_NAME}</div><div class="hdr-sub">${PROF_NAME}</div></div>
+    <div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center">
+      ${isRes?`
+        <button class="tab" onclick="setAba('provas')">← Provas</button>
+        <button class="tab${S.abaProf==="resultados"?" active":""}" onclick="setAba('resultados')">Resultados</button>
+        <button class="tab${S.abaProf==="analise"?" active":""}" onclick="setAba('analise')">Análise</button>
+      `:`
+        <button class="tab${S.abaProf==="provas"?" active":""}" onclick="setAba('provas')">📋 Provas</button>
+        <button class="tab${S.abaProf==="nova"?" active":""}" onclick="setAba('nova')">➕ Nova</button>
+        <button class="tab${S.abaProf==="turmas"?" active":""}" onclick="setAba('turmas')">👥 Turmas</button>
+        <button class="tab${S.abaProf==="config"?" active":""}" onclick="setAba('config')">⚙️ Config</button>
+      `}
+      <button class="tab" onclick="set({rota:'home',profLogado:false})" style="border-color:#fca5a5;color:#991b1b">Sair</button>
+    </div>`;
+  el.appendChild(hdr);
+  const body=document.createElement("div");
+  body.style.cssText="max-width:900px;margin:0 auto;padding:24px 14px;min-height:calc(100vh - 62px)";
+  if(S.abaProf==="provas")renderProvas(body);
+  else if(S.abaProf==="nova")renderNova(body);
+  else if(S.abaProf==="turmas")renderTurmas(body);
+  else if(S.abaProf==="config")renderConfig(body);
+  else if(S.abaProf==="resultados"&&S.resultadosProva)renderResultados(body,S.resultadosProva);
+  else if(S.abaProf==="analise"&&S.resultadosProva)renderAnalise(body,S.resultadosProva);
+  else renderProvas(body);
+  el.appendChild(body);
+}
+function setAba(a){
+  if(a==="provas"){S.resultadosProva=null;carregarProvas();}
+  set({abaProf:a});
+}
+
+async function carregarProvas(){
+  if(!CFG.gasUrl)return;
+  set({loadingProvas:true});
+  try{
+    const r=await api({acao:"listarProvas",senha:PASS});
+    if(r.ok){S.provas=r.provas||[];S.gasStatus="ok";}
+    else S.gasStatus="erro";
+  }catch(e){S.gasStatus="erro";console.warn(e);}
+  set({loadingProvas:false});
+}
+
+// ── Lista de provas ──
+function renderProvas(el){
+  const provas=S.provas;
+  if(S.loadingProvas){el.innerHTML=`<div class="card" style="text-align:center;padding:48px"><div class="spin"></div><span style="color:#64748b">Carregando provas…</span></div>`;return;}
+  if(!CFG.gasUrl){el.innerHTML=`<div class="card" style="text-align:center;padding:48px;color:#94a3b8"><div style="font-size:32px;margin-bottom:12px">⚙️</div>Configure a URL do Apps Script na aba <strong>Config</strong> antes de usar.</div>`;return;}
+  if(!provas.length){el.innerHTML=`<div class="card" style="text-align:center;padding:52px"><div style="font-size:42px;margin-bottom:12px">📝</div><div style="font-size:16px;color:#64748b">Nenhuma prova criada ainda.</div><button class="btn primary sm" style="margin-top:14px" onclick="setAba('nova')">➕ Criar primeira prova</button></div>`;return;}
+  const wrap=document.createElement("div");wrap.style.cssText="display:flex;flex-direction:column;gap:12px";
+  for(const p of [...provas].reverse()){
+    const isQuiz=p.tipo==="Quiz";
+    const d=document.createElement("div");d.className="card";
+    d.innerHTML=`
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+        <div>
+          <div style="font-weight:700;font-size:15px;color:#1e293b;margin-bottom:5px">${escH(p.nome)}</div>
+          <div style="font-size:12px;color:#64748b;margin-bottom:6px">${escH(p.disciplina)} · ${escH(p.tipo)} · ${escH(p.dataProva||"")} · ${p.questoes.length} questões · ${p.tempoMinutos} min${p.horaInicio?` · ${p.horaInicio}–${p.horaFim}`:""}</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <span class="badge" style="background:${isQuiz?"#dbeafe":"#dcfce7"};color:${isQuiz?"#1e40af":"#166534"}">${isQuiz?"⚡ Quiz":"📋 "+p.tipo}</span>
+            <span class="badge" style="background:${p.encerrada?"#fee2e2":"#dcfce7"};color:${p.encerrada?"#991b1b":"#166534"}">${p.encerrada?"🔒 Encerrada":"🟢 Aberta"}</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:7px 14px;display:flex;align-items:center;gap:8px">
+            <span style="font-size:11px;color:#166534;font-weight:600;text-transform:uppercase">Código</span>
+            <span style="font-weight:900;letter-spacing:3px;color:#14532d;font-size:18px">${p.codigo}</span>
+            <button class="btn sm" onclick="copiarCod('${p.codigo}','cp_${p.id}')"><span id="cp_${p.id}">📋</span></button>
+          </div>
+          <button class="btn sm primary" onclick="verRes('${p.id}')">Ver Resultados</button>
+          ${!p.encerrada?`<button class="btn sm danger" onclick="encerrarProva('${p.id}')">Encerrar</button>`:""}
+        </div>
+      </div>`;
+    wrap.appendChild(d);
+  }
+  el.appendChild(wrap);
+}
+function copiarCod(cod,sid){navigator.clipboard?.writeText(cod).catch(()=>{});const sp=document.getElementById(sid);if(sp){sp.textContent="✅";setTimeout(()=>sp.textContent="📋",2000);}}
+async function encerrarProva(id){
+  const p=S.provas.find(x=>x.id===id);if(!p)return;
+  if(!confirm("Encerrar esta prova? Alunos não poderão mais acessar."))return;
+  setLoad("Encerrando…");
+  try{await api({acao:"salvarProva",senha:PASS,prova:{...p,encerrada:true}});await carregarProvas();}
+  catch(e){alert("Erro: "+e.message);}
+  stopLoad();
+}
+async function verRes(id){
+  const p=S.provas.find(x=>x.id===id);if(!p)return;
+  setLoad("Carregando resultados…");
+  try{
+    const r=await api({acao:"listarResultados",senha:PASS,disciplina:p.disciplina,tipo:p.tipo,provaId:id});
+    S.resultadosProva={...p,_resultados:r.ok?(r.resultados||[]):[]};
+    set({abaProf:"resultados"});
+  }catch(e){alert("Erro ao carregar resultados: "+e.message);}
+  stopLoad();
+}
+
+// ── Nova prova ──
+function renderNova(el){
+  const np=S.np,isQuiz=np.tipo==="Quiz";
+  el.innerHTML=`
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;margin-bottom:16px;color:#14532d">Nova avaliação</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:4px">
+        <div><label>Disciplina</label>
+          <select class="inp" id="np_disc" onchange="npField('disciplina',this.value)">
+            <option value="">Selecione…</option>
+            ${DISCIPLINAS.map(d=>`<option value="${d}"${np.disciplina===d?" selected":""}>${d}</option>`).join("")}
+          </select></div>
+        <div><label>Tipo</label>
+          <select class="inp" id="np_tipo" onchange="npTipo(this.value)">
+            <option value="">Selecione…</option>
+            ${TIPOS.map(t=>`<option value="${t}"${np.tipo===t?" selected":""}>${t}</option>`).join("")}
+          </select></div>
+        <div><label>Semestre</label>
+          <input class="inp" id="np_sem" value="${escH(np.semestre)}" placeholder="2026.1" oninput="npField('semestre',this.value)"/></div>
+        <div><label>Data da avaliação</label>
+          <input class="inp" id="np_data" type="date" value="${np.data}" onchange="npField('data',this.value)"/></div>
+        <div><label>Hora início (opcional)</label>
+          <input class="inp" id="np_hini" type="time" value="${np.horaIni}" onchange="npField('horaIni',this.value)"/></div>
+        <div><label>Hora fim (opcional)</label>
+          <input class="inp" id="np_hfim" type="time" value="${np.horaFim}" onchange="npField('horaFim',this.value)"/></div>
+        <div><label>Descrição (ex: Semana 2)</label>
+          <input class="inp" id="np_desc" value="${escH(np.descricao)}" placeholder="Opcional" oninput="npField('descricao',this.value)"/></div>
+        <div><label>Tempo (min)${isQuiz?" — fixo 10 min":""}</label>
+          <input class="inp" id="np_tempo" type="number" value="${isQuiz?"10":np.tempo}" ${isQuiz?"readonly style='background:#f1f5f9;color:#94a3b8'":""} oninput="npField('tempo',this.value)"/></div>
+        <div><label>Penalidade 1ª violação (%)</label>
+          <input class="inp" id="np_pen" type="number" value="${np.pen}" oninput="npField('pen',this.value)"/></div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
+        <div style="font-weight:700;font-size:15px;color:#14532d">Questões${isQuiz?" — Quiz (5 questões · 2 pts cada)":""}</div>
+        <div style="display:flex;gap:6px">
+          <button onclick="npAba('editor')" class="tab${np.aba==='editor'?' active':''}">✏️ Editor</button>
+          <button onclick="npAba('preview')" class="tab${np.aba==='preview'?' active':''}">👁 Preview (${np.questoes.length})</button>
+        </div>
+      </div>
+      ${np.aba==="editor"?`
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12px;color:#166534;line-height:1.9">
+          <strong>Formato:</strong> &nbsp;
+          <code style="background:#dcfce7;padding:1px 6px;border-radius:4px">1. Enunciado</code> &nbsp;
+          <code style="background:#dcfce7;padding:1px 6px;border-radius:4px">A) alternativa</code> &nbsp;
+          <code style="background:#dcfce7;padding:1px 6px;border-radius:4px">Gabarito: A</code>
+        </div>
+        <textarea class="inp" id="np_txt" rows="11" style="resize:vertical;font-size:13px;line-height:1.6" placeholder="Cole as questões aqui…">${escH(np.texto)}</textarea>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button class="btn primary sm" onclick="importarQs()">Importar questões →</button>
+          <button class="btn sm" onclick="carregarEx()">Carregar exemplo</button>
+        </div>`:`
+        <div style="max-height:420px;overflow-y:auto">
+          ${np.questoes.map((q,i)=>`
+            <div style="border-bottom:1px solid #f1f5f9;padding-bottom:12px;margin-bottom:12px">
+              <div style="font-weight:600;font-size:14px;margin-bottom:8px">${i+1}. ${escH(q.enunciado)}</div>
+              ${q.alternativas.map((a,ai)=>`
+                <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:8px;background:${ai===q.correta?"#dcfce7":"#f8fafc"};border:1px solid ${ai===q.correta?"#86efac":"#e2e8f0"};margin-bottom:4px">
+                  <span style="font-weight:700;color:${ai===q.correta?"#166534":"#94a3b8"};font-size:13px;width:18px">${String.fromCharCode(65+ai)})</span>
+                  <span style="font-size:13px">${escH(a)}</span>
+                  ${ai===q.correta?`<span style="margin-left:auto;font-size:11px;font-weight:700;color:#166534">✓ GABARITO</span>`:""}
+                </div>`).join("")}
+              ${q.correta<0?`<div style="color:#dc2626;font-size:12px;margin-top:4px">⚠️ Gabarito não encontrado</div>`:""}
+            </div>`).join("")}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;padding-top:8px">
+          <button class="btn primary sm" onclick="criarProva()" ${!np.disciplina||!np.tipo||!np.questoes.length?"disabled":""}>✅ Criar avaliação</button>
+          <button class="btn sm" onclick="npAba('editor')">← Editar</button>
+        </div>`}
+      <div id="np_err" style="color:#dc2626;font-size:13px;min-height:18px;margin-top:8px"></div>
+    </div>
+  </div>`;
+}
+function npField(k,v){S.np[k]=v;render();}
+function npTipo(v){S.np.tipo=v;if(v==="Quiz")S.np.tempo="10";render();}
+function npAba(a){
+  S.np.disciplina=document.getElementById("np_disc")?.value||S.np.disciplina;
+  S.np.tipo=document.getElementById("np_tipo")?.value||S.np.tipo;
+  S.np.semestre=document.getElementById("np_sem")?.value||S.np.semestre;
+  S.np.data=document.getElementById("np_data")?.value||S.np.data;
+  S.np.horaIni=document.getElementById("np_hini")?.value||S.np.horaIni;
+  S.np.horaFim=document.getElementById("np_hfim")?.value||S.np.horaFim;
+  S.np.descricao=document.getElementById("np_desc")?.value||S.np.descricao;
+  S.np.pen=document.getElementById("np_pen")?.value||S.np.pen;
+  if(S.np.tipo!=="Quiz")S.np.tempo=document.getElementById("np_tempo")?.value||S.np.tempo;
+  const txt=document.getElementById("np_txt");if(txt)S.np.texto=txt.value;
+  S.np.aba=a;render();
+}
+function importarQs(){
+  npAba(S.np.aba);
+  const qs=parseQ(S.np.texto);
+  if(!qs.length){const e=document.getElementById("np_err");if(e)e.textContent="Nenhuma questão reconhecida. Verifique o formato.";return;}
+  S.np.questoes=qs;S.np.aba="preview";render();
+}
+function carregarEx(){
+  S.np.texto=`1. Qual movimento literário valoriza o sentimento e a natureza?\nA) Realismo\nB) Romantismo\nC) Barroco\nD) Modernismo\nGabarito: B\n\n2. A obra "Iracema" pertence a qual fase do Romantismo?\nA) Indianismo\nB) Ultrarromantismo\nC) Condoreirismo\nD) Realismo mágico\nGabarito: A`;
+  render();
+}
+async function criarProva(){
+  const np=S.np;
+  if(!np.disciplina||!np.tipo||!np.questoes.length)return;
+  if(np.questoes.some(q=>q.correta<0)){const e=document.getElementById("np_err");if(e)e.textContent="Algumas questões não têm gabarito reconhecido.";return;}
+  const dataFmt=np.data?new Date(np.data+"T12:00:00").toLocaleDateString("pt-BR"):"";
+  const prova={
+    id:Date.now().toString(),
+    nome:`${np.disciplina} — ${[np.tipo,dataFmt,np.descricao].filter(Boolean).join(" · ")}`,
+    disciplina:np.disciplina,tipo:np.tipo,
+    dataProva:dataFmt,descricao:np.descricao,semestre:np.semestre,
+    ano:new Date().getFullYear().toString(),
+    codigo:Math.random().toString(36).substr(2,6).toUpperCase(),
+    tempoMinutos:np.tipo==="Quiz"?10:parseInt(np.tempo)||40,
+    penalidade1:parseInt(np.pen)||20,
+    horaInicio:np.horaIni,horaFim:np.horaFim,
+    questoes:np.questoes,encerrada:false,
+    criadaEm:new Date().toLocaleString("pt-BR")
+  };
+  setLoad("Salvando prova…");
+  try{
+    const r=await api({acao:"salvarProva",senha:PASS,prova});
+    if(!r.ok)throw new Error(r.erro||"Erro desconhecido");
+    S.np={disciplina:"",tipo:"",data:"",semestre:SEMESTRE,descricao:"",tempo:"40",pen:"20",horaIni:"",horaFim:"",texto:"",questoes:[],aba:"editor"};
+    await carregarProvas();set({abaProf:"provas"});
+  }catch(e){stopLoad();const err=document.getElementById("np_err");if(err)err.textContent=e.message;}
+  stopLoad();
+}
+
+// ── Turmas ──
+function renderTurmas(el){
+  el.innerHTML=`
+  <div style="display:flex;flex-direction:column;gap:14px">
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;color:#14532d;margin-bottom:6px">Cadastro de Turmas</div>
+      <div style="font-size:13px;color:#64748b;margin-bottom:16px">Cole o texto copiado do PDF do Q-Acadêmico (matrícula + nome + Cursando).</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:12px">
+        <div><label>Disciplina</label>
+          <select class="inp" id="t_disc">
+            <option value="">Selecione…</option>
+            ${DISCIPLINAS.map(d=>`<option value="${d}">${d}</option>`).join("")}
+          </select></div>
+        <div><label>Semestre</label>
+          <input class="inp" id="t_sem" value="${SEMESTRE}" placeholder="2026.1"/></div>
+      </div>
+      <label>Lista de alunos</label>
+      <textarea class="inp" id="t_txt" rows="10" style="resize:vertical;font-size:13px;line-height:1.8;margin-bottom:10px"
+        placeholder="202611300345 Ana Clara Amorim das Chagas Cursando&#10;202611300388 Ana Julia de Almeida Pereira Cursando&#10;…"></textarea>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn primary sm" onclick="previewAlunos()">👁 Preview</button>
+        <button class="btn sm" onclick="document.getElementById('t_txt').value=''">Limpar</button>
+      </div>
+      <div id="t_preview" style="margin-top:14px"></div>
+    </div>
+  </div>`;
+}
+function previewAlunos(){
+  const disc=document.getElementById("t_disc")?.value;
+  const sem=document.getElementById("t_sem")?.value;
+  const txt=document.getElementById("t_txt")?.value||"";
+  const prev=document.getElementById("t_preview");if(!prev)return;
+  if(!disc){prev.innerHTML=`<div style="color:#dc2626;font-size:13px">Selecione a disciplina.</div>`;return;}
+  const alunos=parseAlunos(txt);
+  if(!alunos.length){prev.innerHTML=`<div style="color:#dc2626;font-size:13px">Nenhum aluno reconhecido. Verifique o formato.</div>`;return;}
+  prev.innerHTML=`
+    <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:14px;margin-bottom:10px">
+      <div style="font-weight:700;font-size:14px;color:#166534;margin-bottom:8px">${alunos.length} alunos — ${escH(disc)} · ${escH(sem)}</div>
+      <div style="max-height:200px;overflow-y:auto;font-size:13px;color:#374151;line-height:1.9">
+        ${alunos.map((a,i)=>`<div style="padding:2px 0;border-bottom:1px solid #dcfce7">${i+1}. ${a.matricula?`<span style="color:#94a3b8;font-size:11px">${escH(a.matricula)}</span> `:""}<strong>${escH(a.nome)}</strong></div>`).join("")}
+      </div>
+    </div>
+    <button class="btn primary" onclick="cadastrarTurma()">✅ Cadastrar ${alunos.length} alunos</button>`;
+}
+async function cadastrarTurma(){
+  const disc=document.getElementById("t_disc")?.value;
+  const sem=document.getElementById("t_sem")?.value;
+  const txt=document.getElementById("t_txt")?.value||"";
+  const alunos=parseAlunos(txt);
+  if(!disc||!alunos.length)return;
+  setLoad("Cadastrando turma…");
+  try{
+    const r=await api({acao:"cadastrarTurma",senha:PASS,disciplina:disc,semestre:sem,alunos});
+    if(!r.ok)throw new Error(r.erro);
+    stopLoad();alert(`✅ ${r.cadastrados} alunos cadastrados em ${disc} · ${sem}`);
+  }catch(e){stopLoad();alert("Erro: "+e.message);}
+}
+
+// ── Resultados ──
+function renderResultados(el,p){
+  const rs=p._resultados||[];
+  const ord=S.ordenacao;
+  const sorted=[...rs].sort((a,b)=>ord==="nome"?a.nome.localeCompare(b.nome,"pt-BR"):parseFloat(b.notaFinal)-parseFloat(a.notaFinal));
+  const media=rs.length?(rs.reduce((s,r)=>s+parseFloat(r.notaFinal),0)/rs.length).toFixed(1):"—";
+  el.innerHTML=`
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+    <div>
+      <div style="font-weight:700;font-size:16px;color:#14532d">${escH(p.nome)}</div>
+      <div style="font-size:13px;color:#64748b">Código: <strong style="letter-spacing:2px;color:#166534">${p.codigo}</strong> · ${p.questoes.length} questões · ${p.tempoMinutos} min</div>
+    </div>
+    <button class="btn sm primary" onclick="exportCSV()" ${!rs.length?"disabled":""}>↓ Exportar CSV</button>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px">
+    ${[["Entregas",rs.length],["Média",media],["Aprovados ≥6",rs.filter(r=>parseFloat(r.notaFinal)>=6).length],["Violações",rs.reduce((s,r)=>s+(r.violacoes||0),0)]].map(([l,v])=>`
+      <div class="card" style="padding:14px 16px"><div style="font-size:26px;font-weight:800;color:#166534">${v}</div><div style="font-size:12px;color:#64748b;margin-top:2px">${l}</div></div>`).join("")}
+  </div>
+  <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
+    <span style="font-size:13px;color:#64748b">Ordenar:</span>
+    <button onclick="set({ordenacao:'nome'})" class="tab${ord==='nome'?' active':''}">A–Z</button>
+    <button onclick="set({ordenacao:'nota'})" class="tab${ord==='nota'?' active':''}">Maior nota</button>
+  </div>
+  ${!rs.length?`<div class="card" style="text-align:center;padding:40px;color:#94a3b8"><div style="font-size:32px;margin-bottom:8px">⏳</div>Aguardando entregas…</div>`:`
+  <div class="card" style="padding:0;overflow:hidden"><div style="overflow-x:auto">
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead><tr style="background:#f0fdf4">
+      ${["#","Matrícula","Nome","Acertos","Nota","Penalidade","Violações","Motivo","Data"].map(h=>`<th style="padding:10px 12px;text-align:left;font-size:11px;font-weight:700;color:#166534;text-transform:uppercase;letter-spacing:.8px;border-bottom:2px solid #bbf7d0">${h}</th>`).join("")}
+    </tr></thead>
+    <tbody>
+      ${sorted.map((r,i)=>`<tr style="background:${i%2?"#f8fafc":"#fff"}">
+        <td style="padding:9px 12px;color:#94a3b8">${i+1}</td>
+        <td style="padding:9px 12px;color:#94a3b8;font-size:11px">${escH(r.matricula||"—")}</td>
+        <td style="padding:9px 12px;font-weight:600">${escH(r.nome)}</td>
+        <td style="padding:9px 12px">${r.acertos}/${r.total}</td>
+        <td style="padding:9px 12px;font-weight:800;font-size:15px;color:${parseFloat(r.notaFinal)>=6?"#166534":"#991b1b"}">${r.notaFinal}</td>
+        <td style="padding:9px 12px;color:${r.penalidade>0?"#991b1b":"#94a3b8"}">${r.penalidade>0?"-"+r.penalidade+"%":"—"}</td>
+        <td style="padding:9px 12px;color:${r.violacoes>0?"#92400e":"#94a3b8"}">${r.violacoes}</td>
+        <td style="padding:9px 12px;font-size:12px;color:#94a3b8">${escH(r.motivo)}</td>
+        <td style="padding:9px 12px;font-size:11px;color:#94a3b8">${escH(r.data)}</td>
+      </tr>`).join("")}
+    </tbody>
+  </table></div></div>`}`;
+}
+function exportCSV(){
+  const p=S.resultadosProva;if(!p)return;
+  const rs=p._resultados||[];
+  let out="Matrícula,Nome,Acertos,Total,Nota Bruta,Penalidade,Nota Final,Violações,Motivo,Data\n";
+  out+=rs.map(r=>[r.matricula,r.nome,r.acertos,r.total,r.notaBruta,r.penalidade,r.notaFinal,r.violacoes,r.motivo,r.data].map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(",")).join("\n");
+  const b=new Blob(["﻿"+out],{type:"text/csv;charset=utf-8;"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download=p.nome.replace(/[^a-z0-9]/gi,"_")+".csv";a.click();
+}
+
+// ── Análise ──
+function renderAnalise(el,p){
+  const rs=p._resultados||[];
+  if(!rs.length){el.innerHTML=`<div class="card" style="text-align:center;padding:48px;color:#94a3b8">Sem entregas para analisar.</div>`;return;}
+  const temDetalhes=rs.some(r=>r.respostasOriginais);
+  if(!temDetalhes){el.innerHTML=`<div class="card" style="padding:28px"><div style="font-weight:700;font-size:15px;color:#14532d;margin-bottom:10px">Análise de Questões</div><div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px;font-size:13px;color:#78350f">Análise detalhada disponível nas próximas provas realizadas com esta versão.</div></div>`;return;}
+  const stats={};
+  for(const q of p.questoes)stats[q.id]={enunciado:q.enunciado,alternativas:q.alternativas,correta:q.correta,acertos:0,total:0,votos:new Array(q.alternativas.length).fill(0)};
+  for(const r of rs){if(!r.respostasOriginais)continue;for(const[qid,altIdx]of Object.entries(r.respostasOriginais)){const s=stats[parseInt(qid)||qid];if(!s)continue;s.total++;if(typeof altIdx==="number"&&altIdx>=0){if(altIdx===s.correta)s.acertos++;if(altIdx<s.votos.length)s.votos[altIdx]++;}}}
+  const lista=Object.values(stats).filter(s=>s.total>0).map(s=>({...s,percAcerto:Math.round((s.acertos/s.total)*100),percErro:Math.round(((s.total-s.acertos)/s.total)*100)})).sort((a,b)=>b.percErro-a.percErro);
+  let html=`<div style="margin-bottom:16px"><div style="font-weight:700;font-size:16px;color:#14532d">Análise de Questões</div><div style="font-size:13px;color:#64748b">${escH(p.nome)} · ${rs.length} alunos</div></div><div style="display:flex;flex-direction:column;gap:12px">`;
+  for(const q of lista){
+    const qNum=p.questoes.findIndex(x=>x.id===q.id)+1;
+    html+=`<div class="card">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase">Q${qNum}</span>
+        <span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:12px;background:${q.percErro>=60?"#fee2e2":q.percErro>=30?"#fffbeb":"#dcfce7"};color:${q.percErro>=60?"#991b1b":q.percErro>=30?"#78350f":"#166534"}">${q.percErro}% erro</span>
+        <span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:12px;background:#dcfce7;color:#166534">${q.percAcerto}% acerto</span>
+      </div>
+      <div style="font-size:14px;font-weight:600;margin-bottom:10px">${escH(q.enunciado)}</div>
+      ${q.alternativas.map((a,ai)=>{const votos=q.votos[ai]||0;const pct=q.total>0?Math.round((votos/q.total)*100):0;const isC=ai===q.correta;
+        return`<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:7px;background:${isC?"#dcfce7":"#f8fafc"};border:1px solid ${isC?"#86efac":"#e2e8f0"};margin-bottom:4px">
+          <span style="font-weight:700;font-size:12px;color:${isC?"#166534":"#94a3b8"};width:18px">${String.fromCharCode(65+ai)})</span>
+          <span style="font-size:13px;flex:1">${escH(a)}</span>
+          <span style="font-size:11px;font-weight:700;color:${isC?"#166534":"#94a3b8"}">${votos}x (${pct}%)</span>
+          ${isC?`<span style="font-size:10px;color:#166534;font-weight:700">✓</span>`:""}
+        </div>`;}).join("")}
+    </div>`;
+  }
+  html+="</div>";el.innerHTML=html;
+}
+
+// ── Config ──
+function renderConfig(el){
+  const pen=BKP.pendentes();
+  el.innerHTML=`<div style="display:flex;flex-direction:column;gap:14px">
+    <div class="card">
+      <div style="font-weight:700;font-size:15px;color:#14532d;margin-bottom:16px">⚙️ Configuração — Google Apps Script</div>
+      <label>URL do Apps Script (deploy)</label>
+      <input class="inp" id="gas_url" value="${escH(CFG.gasUrl)}" placeholder="https://script.google.com/macros/s/…/exec" style="margin-bottom:12px"/>
+      <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:#166534;line-height:2">
+        <strong>Como configurar:</strong><br>
+        1. Abra sua planilha Google → Extensões → Apps Script<br>
+        2. Cole o conteúdo do arquivo <code>apps_script.js</code> → salve (Ctrl+S)<br>
+        3. Implantar → Nova implantação → App da Web<br>
+        4. Executar como: <strong>Eu</strong> · Acesso: <strong>Qualquer pessoa</strong><br>
+        5. Cole a URL gerada acima e clique em Salvar
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn primary sm" id="btn_cfg" onclick="salvarCfg()">Salvar configuração</button>
+        <button class="btn sm" id="btn_test" onclick="testarConexao()">🔌 Testar conexão</button>
+      </div>
+      <div id="cfg_msg" style="font-size:13px;margin-top:10px;min-height:18px"></div>
+    </div>
+    ${pen.length?`
+    <div class="card" style="border-left:4px solid #f59e0b">
+      <div style="font-weight:700;font-size:14px;color:#78350f;margin-bottom:6px">⚠️ ${pen.length} resultado(s) pendente(s) de envio</div>
+      <div style="font-size:13px;color:#92400e;margin-bottom:10px">Estes resultados foram salvos localmente por falha de rede. Configure a URL e clique para reenviar.</div>
+      <button class="btn sm primary" onclick="reenviarManual()">Reenviar agora</button>
+    </div>`:""}
+  </div>`;
+}
+function salvarCfg(){const el=document.getElementById("gas_url");if(!el)return;CFG.gasUrl=el.value.trim();const btn=document.getElementById("btn_cfg");if(btn){btn.textContent="✅ Salvo!";setTimeout(()=>btn.textContent="Salvar configuração",2500);}}
+async function testarConexao(){
+  const msg=document.getElementById("cfg_msg");
+  if(!CFG.gasUrl){if(msg)msg.innerHTML=`<span style="color:#dc2626">Salve a URL primeiro.</span>`;return;}
+  if(msg)msg.innerHTML=`<span class="spin"></span><span style="color:#166534">Testando…</span>`;
+  try{
+    const r=await api({acao:"listarProvas",senha:PASS},1);
+    S.gasStatus=r.ok?"ok":"erro";
+    if(msg)msg.innerHTML=r.ok?
+      `<span style="color:#166534">✅ Conexão OK — ${(r.provas||[]).length} provas encontradas.</span>`:
+      `<span style="color:#dc2626">❌ Servidor respondeu com erro: ${escH(r.erro)}</span>`;
+  }catch(e){S.gasStatus="erro";if(msg)msg.innerHTML=`<span style="color:#dc2626">❌ ${escH(e.message)}</span>`;}
+}
+async function reenviarManual(){
+  setLoad("Reenviando resultados…");
+  await reenviarPendentes();
+  stopLoad();
+  render();
+}
+
+// ══════════════════════════════════════════
+// ALUNO — IDENTIFICAÇÃO
+// ══════════════════════════════════════════
+let alunosCache={},provaCarregada=null,alunoSelecionado=null;
+
+function renderAlunoId(el){
+  el.innerHTML=`
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#14532d,#15803d);padding:16px">
+    <div class="card" style="max-width:500px;width:100%">
+      <div style="margin-bottom:16px">
+        <div style="font-size:20px;font-weight:800;color:#14532d">${APP_NAME}</div>
+        <div style="font-size:13px;color:#64748b">Avaliação</div>
+      </div>
+      <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:13px;color:#78350f;line-height:1.6">
+        ⚠️ Sair desta tela durante a prova é violação.<br>
+        1ª saída: <strong>penalidade na nota</strong> · 2ª saída: <strong>prova encerrada automaticamente</strong>
+      </div>
+      <label>Código da prova</label>
+      <input class="inp" id="al_cod" placeholder="Ex: AB12CD" style="text-transform:uppercase;margin-bottom:6px" oninput="onCodInput(this.value)"/>
+      <div id="al_prova_info" style="min-height:40px;margin-bottom:10px"></div>
+      <div id="al_nome_wrap" style="display:none">
+        <label>Seu nome — comece a digitar para filtrar</label>
+        <input class="inp" id="al_nome_busca" placeholder="Digite para filtrar…" oninput="filtrarNomes(this.value)" style="margin-bottom:6px" autocomplete="off"/>
+        <div id="al_lista" style="border:1.5px solid #d1d5db;border-radius:8px;max-height:180px;overflow-y:auto;background:#fff"></div>
+        <div id="al_selecionado" style="margin-top:8px;min-height:24px"></div>
+      </div>
+      <div id="al_err" style="color:#dc2626;font-size:13px;min-height:18px;margin-bottom:8px"></div>
+      <button class="btn primary" style="width:100%;margin-bottom:8px" id="btn_iniciar" disabled onclick="iniciarProva()">Iniciar prova →</button>
+      <button class="btn sm" style="width:100%" onclick="set({rota:'home'})">← Voltar</button>
+    </div>
+  </div>`;
+}
+
+async function onCodInput(v){
+  const cod=v.trim().toUpperCase();
+  const info=document.getElementById("al_prova_info");
+  const wrap=document.getElementById("al_nome_wrap");
+  const err=document.getElementById("al_err");
+  const btn=document.getElementById("btn_iniciar");
+  if(err)err.textContent="";
+  provaCarregada=null;alunoSelecionado=null;
+  if(wrap)wrap.style.display="none";
+  if(btn)btn.disabled=true;
+  if(cod.length<6){if(info)info.innerHTML="";return;}
+  if(info)info.innerHTML=`<div style="font-size:13px;color:#64748b"><span class="spin"></span>Buscando prova…</div>`;
+  try{
+    const r=await api({acao:"buscarProva",codigo:cod},2);
+    if(!r.ok){if(info)info.innerHTML=`<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;padding:9px 12px;font-size:13px;color:#991b1b">${escH(r.erro||"Código não encontrado.")}</div>`;return;}
+    provaCarregada=r.prova;
+    const isQuiz=r.prova.tipo==="Quiz";
+    if(info)info.innerHTML=`<div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:10px 14px;font-size:13px;color:#14532d;line-height:1.8;margin-bottom:4px">
+      <strong>${escH(r.prova.tipo)} · ${escH(r.prova.disciplina)}</strong>${r.prova.dataProva?` · ${escH(r.prova.dataProva)}`:""}${r.prova.descricao?` · ${escH(r.prova.descricao)}`:""}
+      <br>${r.prova.questoes.length} questões · ⏱ ${r.prova.tempoMinutos} min${isQuiz?" · <strong>Quiz — cada questão vale 2,0 pts</strong>":""}
+    </div>`;
+    if(wrap)wrap.style.display="block";
+    const chave=r.prova.disciplina+"|"+(r.prova.semestre||SEMESTRE);
+    if(!alunosCache[chave]){
+      const ra=await api({acao:"listarAlunos",disciplina:r.prova.disciplina,semestre:r.prova.semestre||SEMESTRE},2);
+      alunosCache[chave]=ra.ok?(ra.alunos||[]):[];
+    }
+    renderListaAlunos(alunosCache[chave],"");
+  }catch(e){if(info)info.innerHTML=`<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;padding:9px 12px;font-size:13px;color:#991b1b">${escH(e.message)}</div>`;}
+}
+
+function renderListaAlunos(alunos,filtro){
+  const lista=document.getElementById("al_lista");if(!lista)return;
+  const f=filtro.toLowerCase();
+  const filtrados=filtro?alunos.filter(a=>a.nome.toLowerCase().includes(f)):alunos;
+  if(!filtrados.length){lista.innerHTML=`<div style="padding:12px;text-align:center;color:#94a3b8;font-size:13px">Nenhum aluno encontrado.</div>`;return;}
+  lista.innerHTML=filtrados.map(a=>`
+    <div onclick="selecionarAluno('${escH(a.matricula)}','${a.nome.replace(/'/g,"\\'").replace(/"/g,"&quot;")}')"
+      style="padding:10px 14px;cursor:pointer;font-size:14px;border-bottom:1px solid #f1f5f9"
+      onmouseover="this.style.background='#f0fdf4'" onmouseout="this.style.background='#fff'">
+      ${a.matricula?`<span style="color:#94a3b8;font-size:11px;margin-right:8px">${escH(a.matricula)}</span>`:""}
+      <span style="font-weight:500">${escH(a.nome)}</span>
+    </div>`).join("");
+}
+function filtrarNomes(v){
+  if(!provaCarregada)return;
+  const chave=provaCarregada.disciplina+"|"+(provaCarregada.semestre||SEMESTRE);
+  renderListaAlunos(alunosCache[chave]||[],v);
+}
+function selecionarAluno(mat,nome){
+  alunoSelecionado={matricula:mat,nome};
+  const sel=document.getElementById("al_selecionado");
+  if(sel)sel.innerHTML=`<div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:8px 12px;font-size:13px;color:#14532d;font-weight:600">✓ ${escH(nome)}${mat?` <span style="font-weight:400;color:#166534;font-size:11px">(${escH(mat)})</span>`:""}</div>`;
+  const btn=document.getElementById("btn_iniciar");if(btn)btn.disabled=false;
+  const lista=document.getElementById("al_lista");if(lista)lista.innerHTML="";
+  const busca=document.getElementById("al_nome_busca");if(busca)busca.value=nome;
+}
+
+async function iniciarProva(){
+  if(!provaCarregada||!alunoSelecionado)return;
+  const err=document.getElementById("al_err");
+  const btn=document.getElementById("btn_iniciar");
+  if(btn)btn.disabled=true;if(err)err.textContent="";
+  setLoad("Verificando sessão…");
+  try{
+    const rs=await api({acao:"iniciarSessao",provaId:provaCarregada.id,matricula:alunoSelecionado.matricula||alunoSelecionado.nome});
+    if(!rs.ok){stopLoad();if(err)err.textContent=rs.erro||"Não foi possível iniciar.";if(btn)btn.disabled=false;return;}
+    const token=rs.token;
+    stopLoad();
+    const p=provaCarregada;
+    const seed=alunoSelecionado.nome.split("").reduce((a,c)=>a+c.charCodeAt(0),0);
+    const qs=shuffle(p.questoes,seed).map((q,qi)=>{
+      const idxs=shuffle(q.alternativas.map((_,i)=>i),seed+qi*1000);
+      return{...q,alternativas:idxs.map(i=>q.alternativas[i]),altMap:idxs};
+    });
+    if(S._timer)clearInterval(S._timer);
+    if(S._viol)window.removeEventListener("blur",S._viol);
+    if(S._vis)document.removeEventListener("visibilitychange",S._vis);
+    Object.assign(S,{
+      rota:"aluno_prova",
+      alunoNome:alunoSelecionado.nome,alunoMatricula:alunoSelecionado.matricula||"",
+      alunoProva:p,alunoQs:qs,alunoRes:{},
+      alunoViol:0,alunoPen:0,alunoSeg:p.tempoMinutos*60,
+      alunoIdx:0,alunoAviso:null,alunoFim:null,alunoToken:token,
+      _enc:false,_blurTs:null
+    });
+    // Verificar se há progresso salvo (falha anterior)
+    const bkp=BKP.ler(p.id,alunoSelecionado.matricula||alunoSelecionado.nome);
+    if(bkp&&bkp.alunoSeg>10){
+      if(confirm(`Encontramos um progresso anterior salvo (${Object.keys(bkp.alunoRes||{}).length} respostas, ${fmt(bkp.alunoSeg)} restantes). Deseja continuar de onde parou?`)){
+        S.alunoRes=bkp.alunoRes||{};
+        S.alunoSeg=bkp.alunoSeg;
+        S.alunoViol=bkp.alunoViol||0;
+        S.alunoPen=bkp.alunoPen||0;
+      }
+    }
+    render();iniciarTimer();iniciarDetector();
+  }catch(e){stopLoad();if(err)err.textContent=e.message;if(btn)btn.disabled=false;}
+}
+
+// ══════════════════════════════════════════
+// ALUNO — PROVA
+// ══════════════════════════════════════════
+function renderAlunoProva(el){
+  const qs=S.alunoQs,idx=S.alunoIdx,q=qs[idx],tot=qs.length;
+  const resp=Object.keys(S.alunoRes).length,todas=resp===tot;
+  const sel=S.alunoRes[q.id];
+  const isQuiz=S.alunoProva.tipo==="Quiz";
+  const al=S.alunoSeg<(isQuiz?90:300);
+  const perc=Math.round((S.alunoSeg/(S.alunoProva.tempoMinutos*60))*100);
+
+  el.innerHTML=`
+  <div style="min-height:100vh;background:#f8fafc">
+    <div style="position:sticky;top:0;z-index:100;background:#14532d;padding:9px 14px;display:flex;align-items:center;justify-content:space-between;gap:8px;box-shadow:0 2px 8px rgba(0,0,0,.15)">
+      <div style="min-width:0">
+        <div style="color:#fff;font-weight:700;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escH(S.alunoNome)}</div>
+        <div style="color:#86efac;font-size:10px">${escH(S.alunoProva.tipo)} · ${escH(S.alunoProva.disciplina||"")}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+        <div id="al_timer" style="font-size:18px;font-weight:800;padding:3px 12px;border-radius:7px;background:${al?"#fee2e2":"#dcfce7"};color:${al?"#dc2626":"#166534"};letter-spacing:2px">${fmt(S.alunoSeg)}</div>
+        <div style="width:80px;height:3px;background:rgba(255,255,255,.2);border-radius:2px">
+          <div style="height:100%;width:${perc}%;background:${al?"#dc2626":"#4ade80"};border-radius:2px"></div>
+        </div>
+        ${isQuiz?`<div style="font-size:9px;color:#86efac;font-weight:700">⚡ QUIZ · 2,0 pts/questão</div>`:""}
+      </div>
+      <div style="text-align:right">
+        <div style="color:#86efac;font-size:11px">${resp}/${tot} resp.</div>
+        ${S.alunoViol>0?`<span style="background:#fef3c7;color:#78350f;padding:1px 6px;border-radius:10px;font-size:10px;font-weight:700">⚠ ${S.alunoViol}x</span>`:""}
+        ${S.alunoPen>0?`<span style="background:#fee2e2;color:#991b1b;padding:1px 6px;border-radius:10px;font-size:10px;font-weight:700">-${S.alunoPen}%</span>`:""}
+      </div>
+    </div>
+    <div id="al_aviso" style="background:#dc2626;color:#fff;padding:9px 14px;text-align:center;font-size:13px;font-weight:700;display:${S.alunoAviso?"block":"none"}">${escH(S.alunoAviso||"")}</div>
+    <div style="max-width:580px;margin:0 auto;padding:18px 12px">
+      <div style="display:flex;gap:3px;margin-bottom:16px">
+        ${qs.map((_,i)=>`<div onclick="navQ(${i})" style="flex:1;height:5px;border-radius:3px;cursor:pointer;background:${S.alunoRes[qs[i].id]!==undefined?"#166534":i===idx?"#86efac":"#e2e8f0"}"></div>`).join("")}
+      </div>
+      <div class="card" style="padding:18px 20px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <span style="font-size:11px;font-weight:700;color:#166534;text-transform:uppercase;letter-spacing:1.5px">Questão ${idx+1} de ${tot}</span>
+          ${isQuiz?`<span style="font-size:11px;font-weight:700;background:#dbeafe;color:#1e40af;padding:2px 8px;border-radius:10px">2,0 pontos</span>`:""}
+        </div>
+        <p style="font-size:15px;color:#1e293b;line-height:1.7;font-weight:500;margin-bottom:16px">${escH(q.enunciado)}</p>
+        <div style="display:flex;flex-direction:column;gap:7px">
+          ${q.alternativas.map((a,ai)=>`
+            <button onclick="responder(${q.id},${ai})" style="display:flex;align-items:center;gap:10px;padding:11px 14px;border:1.5px solid ${sel===ai?"#166534":"#e2e8f0"};border-radius:9px;background:${sel===ai?"#dcfce7":"#f8fafc"};cursor:pointer;text-align:left;width:100%">
+              <span style="width:28px;height:28px;border-radius:50%;background:${sel===ai?"#166534":"#e2e8f0"};display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;flex-shrink:0;color:${sel===ai?"#fff":"#64748b"}">${String.fromCharCode(65+ai)}</span>
+              <span style="font-size:14px;color:#374151;flex:1">${escH(a)}</span>
+            </button>`).join("")}
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;gap:8px">
+        <button class="btn sm" onclick="navQ(${idx-1})" ${idx===0?"disabled":""}>← Ant.</button>
+        <span style="font-size:12px;color:#94a3b8">${resp}/${tot} respondidas</span>
+        ${idx<tot-1
+          ?`<button class="btn sm primary" onclick="navQ(${idx+1})">Próx. →</button>`
+          :`<button class="btn primary sm" onclick="confirmarEntrega()" ${!todas?"disabled":""} style="opacity:${todas?1:.45}">${todas?"✅ Entregar":"Responda tudo"}</button>`}
+      </div>
+      ${tot>4?`<div style="display:flex;flex-wrap:wrap;gap:4px;justify-content:center;margin-top:14px">
+        ${qs.map((_,i)=>`<button onclick="navQ(${i})" style="width:32px;height:32px;border-radius:7px;border:1.5px solid ${i===idx?"#166534":"#e2e8f0"};background:${S.alunoRes[qs[i].id]!==undefined?"#dcfce7":"#fff"};cursor:pointer;font-size:12px;font-weight:700;color:${i===idx?"#166534":"#64748b"}">${i+1}</button>`).join("")}
+      </div>`:""}
+    </div>
+  </div>`;
+}
+
+function responder(qid,ai){
+  S.alunoRes={...S.alunoRes,[qid]:ai};
+  // Salvar progresso automaticamente a cada resposta
+  if(S.alunoProva&&(S.alunoMatricula||S.alunoNome)){
+    BKP.salvar(S.alunoProva.id,S.alunoMatricula||S.alunoNome,{alunoRes:S.alunoRes,alunoSeg:S.alunoSeg,alunoViol:S.alunoViol,alunoPen:S.alunoPen});
+  }
+  const app=document.getElementById("app");if(app)renderAlunoProva(app);
+}
+function navQ(i){S.alunoIdx=i;const app=document.getElementById("app");if(app)renderAlunoProva(app);}
+function confirmarEntrega(){
+  if(confirm("Confirma a entrega da prova? Esta ação não pode ser desfeita."))encerrarAluno("Entrega voluntária");
+}
+
+function iniciarTimer(){
+  if(S._timer)clearInterval(S._timer);
+  S._timer=setInterval(()=>{
+    S.alunoSeg--;
+    // Salvar tempo restante no backup a cada 15s
+    if(S.alunoSeg%15===0&&S.alunoProva){
+      BKP.salvar(S.alunoProva.id,S.alunoMatricula||S.alunoNome,{alunoRes:S.alunoRes,alunoSeg:S.alunoSeg,alunoViol:S.alunoViol,alunoPen:S.alunoPen});
+    }
+    if(S.alunoSeg<=0){clearInterval(S._timer);encerrarAluno("Tempo esgotado");return;}
+    const el=document.getElementById("al_timer");
+    if(el){const isQ=S.alunoProva?.tipo==="Quiz";const al=S.alunoSeg<(isQ?90:300);el.textContent=fmt(S.alunoSeg);el.style.color=al?"#dc2626":"#166534";el.style.background=al?"#fee2e2":"#dcfce7";}
+  },1000);
+}
+
+function iniciarDetector(){
+  // Com tolerância: só conta violação se saída durar mais de BLUR_TOLERANCIA_MS
+  const h=()=>{
+    if(S._enc)return;
+    S._blurTs=Date.now();
+    setTimeout(()=>{
+      if(S._enc||!S._blurTs)return;
+      // Só conta se ainda estiver fora da janela
+      if(Date.now()-S._blurTs>=BLUR_TOLERANCIA_MS-100){
+        S._blurTs=null;
+        S.alunoViol++;
+        if(S.alunoViol===1){
+          S.alunoPen=S.alunoProva.penalidade1;
+          S.alunoAviso=`⚠️ Violação detectada! -${S.alunoProva.penalidade1}% na nota. Próxima saída encerra a prova.`;
+          const av=document.getElementById("al_aviso");if(av){av.style.display="block";av.textContent=S.alunoAviso;}
+          setTimeout(()=>{S.alunoAviso=null;const av=document.getElementById("al_aviso");if(av)av.style.display="none";},7000);
+        }else{encerrarAluno("2ª violação — saída de tela");}
+      }
+    },BLUR_TOLERANCIA_MS);
+  };
+  const focus=()=>{S._blurTs=null;}; // Voltou rápido — cancela
+  const vis=()=>{if(document.hidden)h();else S._blurTs=null;};
+  S._viol=h;S._vis=vis;
+  window.addEventListener("blur",h);
+  window.addEventListener("focus",focus);
+  document.addEventListener("visibilitychange",vis);
+}
+
+async function encerrarAluno(motivo){
+  if(S._enc)return;S._enc=true;
+  if(S._timer)clearInterval(S._timer);
+  if(S._viol)window.removeEventListener("blur",S._viol);
+  if(S._vis)document.removeEventListener("visibilitychange",S._vis);
+  const r=calcNota(S.alunoRes,S.alunoQs,S.alunoPen);
+  const respostasOriginais={};
+  for(const q of S.alunoQs){const escolhido=S.alunoRes[q.id];if(escolhido!==undefined)respostasOriginais[q.id]=q.altMap[escolhido];}
+  const resultado={
+    nome:S.alunoNome,matricula:S.alunoMatricula,
+    provaId:S.alunoProva.id,provaNome:S.alunoProva.nome,
+    disciplina:S.alunoProva.disciplina,tipo:S.alunoProva.tipo,
+    dataProva:S.alunoProva.dataProva,semestre:S.alunoProva.semestre||SEMESTRE,
+    data:new Date().toLocaleString("pt-BR"),
+    acertos:r.ac,total:r.tot,notaBruta:r.bruta,
+    penalidade:S.alunoPen,notaFinal:r.final,
+    violacoes:S.alunoViol,motivo,respostasOriginais,
+    _token:S.alunoToken
+  };
+  // Limpar backup — prova entregue
+  BKP.limpar(S.alunoProva.id,S.alunoMatricula||S.alunoNome);
+  set({rota:"aluno_fim",alunoFim:resultado});
+  // Enviar ao Sheets — com fallback local se falhar
+  try{
+    const res=await api({acao:"salvarResultado",resultado,token:S.alunoToken});
+    if(!res.ok)throw new Error(res.erro||"Falha no servidor");
+  }catch(e){
+    // Guarda localmente para reenvio posterior
+    BKP.salvarPendente({...resultado,_token:S.alunoToken});
+    console.warn("[SSA] Resultado salvo localmente. Será reenviado quando houver conexão.");
+  }
+}
+
+// ══════════════════════════════════════════
+// ALUNO — FIM
+// ══════════════════════════════════════════
+function renderAlunoFim(el){
+  const r=S.alunoFim;
+  const ap=parseFloat(r.notaFinal)>=6;
+  const isQuiz=r.tipo==="Quiz";
+  el.innerHTML=`
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#14532d,#15803d);padding:16px">
+    <div class="card" style="max-width:440px;width:100%;text-align:center">
+      <div style="width:64px;height:64px;border-radius:50%;background:#dcfce7;border:3px solid ${ap?"#22c55e":"#f59e0b"};display:flex;align-items:center;justify-content:center;font-size:28px;margin:0 auto 14px">${isQuiz?(ap?"🏆":"📝"):"✓"}</div>
+      <div style="font-size:20px;font-weight:800;color:#1e293b;margin-bottom:4px">${isQuiz?"Quiz concluído!":"Prova entregue!"}</div>
+      <div style="font-size:13px;color:#64748b;margin-bottom:20px">${isQuiz?"Sua nota foi registrada.":"Resposta registrada. O professor divulgará as notas."}</div>
+      <div style="background:#f8fafc;border-radius:10px;padding:14px 18px;text-align:left">
+        ${[
+          ["Aluno",r.nome,false,false],
+          ["Matrícula",r.matricula||"—",false,false],
+          ["Avaliação",r.tipo+" · "+r.disciplina,false,false],
+          ["Acertos",r.acertos+"/"+r.total,false,false],
+          isQuiz?["Nota (0–10)",r.notaFinal,false,true]:null,
+          isQuiz?["Valor 3,0 pts",(parseFloat(r.notaFinal)*0.3).toFixed(2)+" / 3,00",false,false]:null,
+          isQuiz?["Valor 4,0 pts",(parseFloat(r.notaFinal)*0.4).toFixed(2)+" / 4,00",false,false]:null,
+          r.penalidade>0?["Penalidade","-"+r.penalidade+"%",true,false]:null,
+          !isQuiz?["Status","Entregue — aguarde o professor",false,false]:null
+        ].filter(Boolean).map(([l,v,red,big])=>`
+          <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e2e8f0;font-size:14px">
+            <span style="color:#64748b">${l}</span>
+            <strong style="color:${big?(ap?"#166534":"#991b1b"):red?"#991b1b":"#1e293b"};font-size:${big?"18px":"14px"}">${escH(String(v))}</strong>
+          </div>`).join("")}
+      </div>
+      ${!isQuiz?`<div style="margin-top:14px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px;font-size:13px;color:#166534">As notas de ${escH(r.tipo)} serão divulgadas pelo professor.</div>`:""}
+      <div style="font-size:12px;color:#94a3b8;margin-top:14px">Entregue em ${escH(r.data)}.<br>Devolva o celular/tablet ao professor.</div>
+    </div>
+  </div>`;
+}
+
+// Verificar pendentes ao carregar
+reenviarPendentes();
+render();
+</script>
+</body>
+</html>
