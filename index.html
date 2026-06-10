@@ -71,7 +71,7 @@ async function api(dados, tentativas=3) {
       } else {
         resp = await fetch(url, {
           method:"POST",
-          headers:{"Content-Type":"application/json"},
+          headers:{"Content-Type":"text/plain"},
           body:JSON.stringify(dados),
           signal:AbortSignal.timeout(15000)
         });
